@@ -8,9 +8,8 @@ import psutil
 import json
 import threading
 import shutil
-import time
-from flask import Flask, request, render_template_string, jsonify
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from flask import Flask, request
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, 
     MessageHandler, filters, ConversationHandler, CallbackQueryHandler
@@ -33,79 +32,11 @@ running_processes = {}
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- FLASK SERVER & EDITOR ---
+# --- FLASK SERVER (Only for Uptime, No Editor) ---
 app = Flask(__name__)
 
-EDITOR_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Universal Editor</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/dracula.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/python/python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/shell/shell.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/dockerfile/dockerfile.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/properties/properties.min.js"></script>
-    <style>
-        body { margin: 0; padding: 0; background: #282a36; color: #f8f8f2; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
-        .header { padding: 10px; background: #44475a; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #6272a4; }
-        .header h3 { margin: 0; font-size: 14px; color: #8be9fd; }
-        .btn { background: #50fa7b; color: #282a36; border: none; padding: 8px 15px; border-radius: 5px; font-weight: bold; cursor: pointer; }
-        .CodeMirror { flex-grow: 1; font-size: 13px; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h3>📄 {{ filename }}</h3>
-        <button class="btn" onclick="saveCode()">💾 Save & Restart</button>
-    </div>
-    <textarea id="code_area">{{ code }}</textarea>
-    <script>
-        var tg = window.Telegram.WebApp;
-        tg.expand(); 
-        var fname = "{{ filename }}".toLowerCase();
-        var mode = "python";
-        if(fname.endsWith(".js") || fname.endsWith(".json")) mode = "javascript";
-        if(fname.endsWith(".sh")) mode = "shell";
-        if(fname.includes("dockerfile")) mode = "dockerfile";
-        if(fname.endsWith(".env") || fname.endsWith(".txt")) mode = "properties";
-
-        var editor = CodeMirror.fromTextArea(document.getElementById("code_area"), {
-            mode: mode, theme: "dracula", lineNumbers: true
-        });
-
-        function saveCode() {
-            fetch('/save_code', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ 
-                    target_id: "{{ target_id }}", 
-                    filename: "{{ filename }}",
-                    code: editor.getValue()
-                })
-            })
-            .then(r => r.json())
-            .then(data => {
-                if(data.status === 'success') {
-                    tg.showAlert("✅ Saved & Restarting...");
-                    tg.close();
-                } else {
-                    tg.showAlert("❌ Error: " + data.message);
-                }
-            });
-        }
-    </script>
-</body>
-</html>
-"""
-
 @app.route('/')
-def home(): return "🤖 Bot Host is Alive!", 200
+def home(): return "🤖 Bot is Alive!", 200
 
 @app.route('/status')
 def script_status():
@@ -115,86 +46,11 @@ def script_status():
         return f"✅ {script_name} is running.", 200
     return f"❌ {script_name} is stopped.", 404
 
-@app.route('/editor')
-def editor_page():
-    target_id = request.args.get('id')
-    filename = request.args.get('file')
-    uid = int(request.args.get('uid', 0))
-    
-    owner = get_owner(target_id)
-    if uid != ADMIN_ID and uid != owner: return "⛔ Access Denied"
-    
-    work_dir, _, _, _, _ = resolve_paths(target_id)
-    file_path = os.path.join(work_dir, filename)
-    
-    if not os.path.abspath(file_path).startswith(os.path.abspath(work_dir)):
-        return "⛔ Security Block."
-
-    content = ""
-    if os.path.exists(file_path):
-        with open(file_path, 'r') as f: content = f.read()
-    
-    return render_template_string(EDITOR_HTML, code=content, target_id=target_id, filename=filename)
-
-@app.route('/save_code', methods=['POST'])
-def save_code_route():
-    data = request.json
-    target_id = data.get('target_id')
-    filename = data.get('filename')
-    code = data.get('code')
-    
-    work_dir, _, _, _, _ = resolve_paths(target_id)
-    file_path = os.path.join(work_dir, filename)
-
-    try:
-        with open(file_path, 'w') as f: f.write(code)
-        
-        # Smart Install
-        if filename.endswith(".txt") or filename == "requirements.txt":
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", file_path])
-        elif filename == "package.json":
-            subprocess.check_call(["npm", "install"], cwd=work_dir)
-        
-        restart_process_background(target_id)
-        return jsonify({"status": "success"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-
-def resolve_run_command(script_path):
-    ext = script_path.split('.')[-1].lower()
-    if ext == 'js': return ["node", script_path]
-    if ext == 'sh': return ["bash", script_path]
-    return ["python", "-u", script_path] 
-
-def restart_process_background(target_id):
-    work_dir, script_path, env_path, _, _ = resolve_paths(target_id)
-    if target_id in running_processes:
-        try: os.killpg(os.getpgid(running_processes[target_id]['process'].pid), signal.SIGTERM)
-        except: pass
-    
-    custom_env = os.environ.copy()
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for l in f:
-                if '=' in l and not l.strip().startswith('#'):
-                    k,v = l.strip().split('=', 1)
-                    custom_env[k.strip()] = v.strip().strip('"').strip("'")
-    
-    log_path = os.path.join(UPLOAD_DIR, f"{target_id.replace('|','_')}.log")
-    log_file = open(log_path, "w")
-    
-    cmd = resolve_run_command(script_path)
-    try:
-        proc = subprocess.Popen(cmd, env=custom_env, stdout=log_file, stderr=subprocess.STDOUT, cwd=work_dir, preexec_fn=os.setsid)
-        running_processes[target_id] = {"process": proc, "log": log_path}
-    except Exception as e:
-        logger.error(f"Failed to restart: {e}")
-
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- UTILS ---
+# --- DATA & UTILS ---
 def get_allowed_users():
     if not os.path.exists(USERS_FILE): return []
     try:
@@ -224,17 +80,15 @@ def load_ownership():
     except: return {}
 
 def save_ownership(target_id, user_id, type_):
-    data = {}
-    if os.path.exists(OWNERSHIP_FILE):
-        with open(OWNERSHIP_FILE, 'r') as f: data = json.load(f)
+    data = load_ownership()
     data[target_id] = {"owner": user_id, "type": type_}
     with open(OWNERSHIP_FILE, 'w') as f: json.dump(data, f)
 
 def delete_ownership(target_id):
-    if not os.path.exists(OWNERSHIP_FILE): return
-    with open(OWNERSHIP_FILE, 'r') as f: data = json.load(f)
-    if target_id in data: del data[target_id]
-    with open(OWNERSHIP_FILE, 'w') as f: json.dump(data, f)
+    data = load_ownership()
+    if target_id in data:
+        del data[target_id]
+        with open(OWNERSHIP_FILE, 'w') as f: json.dump(data, f)
 
 def get_owner(target_id):
     data = load_ownership()
@@ -247,34 +101,32 @@ def resolve_paths(target_id):
         script_path = file
         env_path = os.path.join(work_dir, ".env")
         req_path = os.path.join(work_dir, "requirements.txt")
-        full_script_path = os.path.join(work_dir, script_path)
     else:
         work_dir = UPLOAD_DIR
         script_path = target_id
         env_path = os.path.join(work_dir, f"{target_id}.env")
         req_path = os.path.join(work_dir, f"{target_id}_req.txt")
-        full_script_path = os.path.join(work_dir, target_id)
-    return work_dir, script_path, env_path, req_path, full_script_path
+    return work_dir, script_path, env_path, req_path
 
 async def install_dependencies(work_dir, update):
     msg = None
     try:
+        # Python
         if os.path.exists(os.path.join(work_dir, "requirements.txt")):
-            if not msg: msg = await update.message.reply_text("⏳ Installing Python Deps...")
+            if not msg: msg = await update.message.reply_text("⏳ Installing Dependencies...")
             proc = await asyncio.create_subprocess_exec("pip", "install", "-r", "requirements.txt", cwd=work_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await proc.communicate()
         
+        # Node
         if os.path.exists(os.path.join(work_dir, "package.json")):
-            if not msg: msg = await update.message.reply_text("⏳ Installing Node Deps...")
-            else: await msg.edit_text("⏳ Installing Node Deps...")
+            if not msg: msg = await update.message.reply_text("⏳ Installing Dependencies...")
             proc = await asyncio.create_subprocess_exec("npm", "install", cwd=work_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await proc.communicate()
             
-        if msg: await msg.edit_text("✅ Dependencies Installed!")
-    except Exception as e:
-        if msg: await msg.edit_text(f"❌ Error: {e}")
+        if msg: await msg.edit_text("✅ Installed!")
+    except: pass
 
-# --- DECORATORS ---
+# --- PERMISSIONS ---
 def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if update.effective_user.id != ADMIN_ID and update.effective_user.id not in get_allowed_users():
@@ -286,7 +138,7 @@ def restricted(func):
 def super_admin_only(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if update.effective_user.id != ADMIN_ID:
-            await update.message.reply_text("⛔ Super Admin Only.")
+            await update.message.reply_text("⛔ Admin Only.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
@@ -301,18 +153,20 @@ def extras_keyboard():
 def git_extras_keyboard():
     return ReplyKeyboardMarkup([["📝 Type Env Vars"], ["📂 Select File to Run", "🔙 Cancel"]], resize_keyboard=True)
 
+# --- STATES ---
+WAIT_FILE, WAIT_EXTRAS, WAIT_ENV_TEXT = range(3)
+WAIT_URL, WAIT_GIT_EXTRAS, WAIT_GIT_ENV_TEXT, WAIT_SELECT_FILE = range(3, 7)
+
+# --- HANDLERS ---
+@restricted
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 **Hosting Bot Ready**", reply_markup=main_menu_keyboard())
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Cancelled.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
-# --- HANDLERS ---
-WAIT_FILE, WAIT_EXTRAS, WAIT_ENV_TEXT = range(3)
-WAIT_URL, WAIT_GIT_EXTRAS, WAIT_GIT_ENV_TEXT, WAIT_SELECT_FILE = range(3, 7)
-
-@restricted
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Mega Hosting Bot**", reply_markup=main_menu_keyboard())
-
+# ... UPLOAD LOGIC ...
 @restricted
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📤 Send file (.py, .js, .sh)", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True))
@@ -323,9 +177,13 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.document.get_file()
     fname = update.message.document.file_name
     uid = update.effective_user.id
-    if not fname.endswith(('.py', '.js', '.sh')): return await update.message.reply_text("❌ Invalid type.")
-    
     path = os.path.join(UPLOAD_DIR, fname)
+    
+    # Conflict check
+    owner = get_owner(fname)
+    if os.path.exists(path) and owner and owner != uid and uid != ADMIN_ID:
+        return await update.message.reply_text("❌ Filename taken by another user.")
+
     await file.download_to_drive(path)
     save_ownership(fname, uid, "file")
     context.user_data.update({'type': 'file', 'target_id': fname, 'work_dir': UPLOAD_DIR})
@@ -340,22 +198,23 @@ async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📝 **Type Env:**", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True))
         return WAIT_ENV_TEXT
     elif "Deps" in txt:
-        await update.message.reply_text("📂 Send `requirements.txt`/`package.json`")
+        await update.message.reply_text("📂 Send `requirements.txt` or `package.json`")
         context.user_data['wait'] = 'req'
     return WAIT_EXTRAS
 
 async def receive_env_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "🔙 Cancel": return await cancel(update, context)
     target_id = context.user_data['target_id']
-    _, _, env_path, _, _ = resolve_paths(target_id)
+    _, _, env_path, _ = resolve_paths(target_id)
     with open(env_path, "a") as f:
         if os.path.exists(env_path) and os.path.getsize(env_path) > 0: f.write("\n")
         f.write(update.message.text)
-    if context.user_data.get('type') == 'repo': 
-        await update.message.reply_text("✅ Saved.", reply_markup=git_extras_keyboard())
-        return WAIT_GIT_EXTRAS
-    await update.message.reply_text("✅ Saved.", reply_markup=extras_keyboard())
-    return WAIT_EXTRAS
+    
+    markup = git_extras_keyboard() if context.user_data.get('type') == 'repo' else extras_keyboard()
+    return_state = WAIT_GIT_EXTRAS if context.user_data.get('type') == 'repo' else WAIT_EXTRAS
+    
+    await update.message.reply_text("✅ Saved.", reply_markup=markup)
+    return return_state
 
 async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('wait'): return WAIT_EXTRAS
@@ -364,14 +223,13 @@ async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE
     target_id = context.user_data['target_id']
     
     path = ""
-    if fname == "package.json":
-        path = os.path.join(UPLOAD_DIR, "package.json")
-    elif fname.endswith(".txt"):
-        path = os.path.join(UPLOAD_DIR, f"{target_id}_req.txt")
+    if fname == "package.json": path = os.path.join(UPLOAD_DIR, "package.json")
+    elif fname.endswith(".txt"): path = os.path.join(UPLOAD_DIR, f"{target_id}_req.txt")
     
     if path:
         await file.download_to_drive(path)
-        msg = await update.message.reply_text("⏳ **Installing Dependencies...**")
+        # Install immediately
+        msg = await update.message.reply_text("⏳ Installing...")
         try:
             if fname.endswith(".txt"):
                 proc = await asyncio.create_subprocess_exec("pip", "install", "-r", path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -379,14 +237,14 @@ async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE
             elif fname == "package.json":
                 proc = await asyncio.create_subprocess_exec("npm", "install", cwd=UPLOAD_DIR, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 await proc.communicate()
-            await msg.edit_text("✅ **Installed!**")
-        except Exception as e:
-            await msg.edit_text(f"❌ Error: {e}")
+            await msg.edit_text("✅ Installed!")
+        except: pass
         
     context.user_data['wait'] = None
     await update.message.reply_text("Next?", reply_markup=extras_keyboard())
     return WAIT_EXTRAS
 
+# ... GIT LOGIC ...
 @restricted
 async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🌐 **Git URL**", reply_markup=ReplyKeyboardMarkup([['🔙 Cancel']], resize_keyboard=True))
@@ -404,8 +262,8 @@ async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.update({'repo_path': repo_path, 'repo_name': repo_name, 'target_id': f"{repo_name}|PLACEHOLDER", 'type': 'repo', 'work_dir': repo_path})
         await update.message.reply_text("⚙️ **Setup**", reply_markup=git_extras_keyboard())
         return WAIT_GIT_EXTRAS
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+    except:
+        await update.message.reply_text("❌ Clone Failed")
         return ConversationHandler.END
 
 async def receive_git_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,7 +281,7 @@ async def show_file_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
     for root, _, fs in os.walk(repo_path):
         for f in fs:
             if f.endswith(('.py', '.js', '.sh')): files.append(os.path.relpath(os.path.join(root, f), repo_path))
-    if not files: return await update.message.reply_text("❌ No executable files.")
+    if not files: return await update.message.reply_text("❌ No scripts found.")
     keyboard = [[InlineKeyboardButton(f, callback_data=f"sel_py_{f}")] for f in files[:15]]
     await update.message.reply_text("👇 **Select:**", reply_markup=InlineKeyboardMarkup(keyboard))
     return WAIT_SELECT_FILE
@@ -439,15 +297,40 @@ async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"✅ Selected `{filename}`")
     return await execute_logic(query, context)
 
+# ... EXECUTION ...
 async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_func = update.message.reply_text if update.message else update.callback_query.message.reply_text
     target_id = context.user_data.get('target_id', context.user_data.get('fallback_id'))
-    restart_process_background(target_id)
-    url = f"{BASE_URL}/status?script={target_id}"
-    await msg_func(f"🚀 **Launched!**\n🔗 `{url}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    work_dir, script_path, env_path, _ = resolve_paths(target_id)
+    
+    if target_id in running_processes:
+        try: os.killpg(os.getpgid(running_processes[target_id]['process'].pid), signal.SIGTERM)
+        except: pass
+    
+    custom_env = os.environ.copy()
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for l in f:
+                if '=' in l and not l.strip().startswith('#'):
+                    k,v = l.strip().split('=', 1)
+                    custom_env[k.strip()] = v.strip().strip('"').strip("'")
+    
+    log_path = os.path.join(UPLOAD_DIR, f"{target_id.replace('|','_')}.log")
+    log_file = open(log_path, "w")
+    
+    cmd = ["python", "-u", script_path]
+    if script_path.endswith(".js"): cmd = ["node", script_path]
+    elif script_path.endswith(".sh"): cmd = ["bash", script_path]
+    
+    try:
+        proc = subprocess.Popen(cmd, env=custom_env, stdout=log_file, stderr=subprocess.STDOUT, cwd=work_dir, preexec_fn=os.setsid)
+        running_processes[target_id] = {"process": proc, "log": log_path}
+        url = f"{BASE_URL}/status?script={target_id}"
+        await msg_func(f"🚀 **Running!**\nPID: {proc.pid}\n🔗 `{url}`", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    except Exception as e: await msg_func(f"❌ Error: {e}")
     return ConversationHandler.END
 
-# --- MANAGE HANDLER (UPDATED FOR ADMIN INFO) ---
+# --- MANAGE & ADMIN LIST (THE REQUESTED FEATURE) ---
 @restricted
 async def list_hosted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -457,18 +340,23 @@ async def list_hosted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for tid, meta in ownership.items():
         owner_id = meta.get("owner")
+        
+        # LOGIC: 
+        # 1. If Admin: Show ALL scripts + Add (User: ID) info
+        # 2. If User: Show ONLY their own scripts
+        
         if uid == ADMIN_ID or uid == owner_id:
             status = "🟢" if tid in running_processes and running_processes[tid]['process'].poll() is None else "🔴"
             
-            # --- NEW: Admin sees Owner ID ---
+            # Label Construction
             label = f"{status} {tid}"
             if uid == ADMIN_ID and uid != owner_id:
-                label += f" (👤 {owner_id})"
-                
+                label += f" (👤 {owner_id})" # <-- ADMIN SEES THIS
+            
             keyboard.append([InlineKeyboardButton(label, callback_data=f"man_{tid}")])
     
-    if not keyboard: return await update.message.reply_text("📂 No apps.")
-    await update.message.reply_text("📂 **Select App:**", reply_markup=InlineKeyboardMarkup(keyboard))
+    if not keyboard: return await update.message.reply_text("📂 No apps found.")
+    await update.message.reply_text("📂 **Hosted Apps:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -479,64 +367,25 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("man_"):
         tid = data.split("man_")[1]
         owner = get_owner(tid)
-        
-        # Security check: Admin OR Owner
         if uid != ADMIN_ID and uid != owner: return await query.message.reply_text("⛔ Not yours.")
         
-        work_dir, script_path, env_path, req_path, _ = resolve_paths(tid)
-        
-        # Get Status
         is_running = tid in running_processes and running_processes[tid]['process'].poll() is None
         status = "🟢 Running" if is_running else "🔴 Stopped"
         
-        # --- NEW: Calculate File Size ---
-        try:
-            full_path = os.path.join(work_dir, script_path)
-            size_kb = round(os.path.getsize(full_path) / 1024, 2)
-        except:
-            size_kb = 0
-
-        # --- NEW: Build Info Text ---
-        admin_info = ""
+        # Admin gets extra info in the text
+        extra_info = ""
         if uid == ADMIN_ID:
-            admin_info = f"\n👤 **Owner:** `{owner}`"
-            
-        text = (
-            f"⚙️ **App:** `{tid}`"
-            f"{admin_info}\n"
-            f"📦 **Size:** `{size_kb} KB`\n"
-            f"📊 **Status:** {status}"
-        )
+            extra_info = f"\n👤 **Owner:** `{owner}`"
+
+        text = f"⚙️ **Manage:** `{tid}`{extra_info}\nStatus: {status}"
         
         btns = []
-        row1 = []
         if is_running:
-            row1.append(InlineKeyboardButton("🛑 Stop", callback_data=f"stop_{tid}"))
-            row1.append(InlineKeyboardButton("🔗 URL", callback_data=f"url_{tid}"))
+            btns.append([InlineKeyboardButton("🛑 Stop", callback_data=f"stop_{tid}"), InlineKeyboardButton("🔗 URL", callback_data=f"url_{tid}")])
         else:
-            row1.append(InlineKeyboardButton("🚀 Run", callback_data=f"rerun_{tid}"))
-        btns.append(row1)
-        
-        editable_files = []
-        if os.path.exists(os.path.join(work_dir, script_path)): editable_files.append(script_path)
-        if "|" not in tid:
-            if os.path.exists(env_path): editable_files.append(os.path.basename(env_path))
-            if os.path.exists(req_path): editable_files.append(os.path.basename(req_path))
-        else:
-            common_files = [".env", "requirements.txt", "package.json", "Dockerfile", "docker-compose.yml"]
-            for f in common_files:
-                if os.path.exists(os.path.join(work_dir, f)): editable_files.append(f)
-        
-        file_btns = []
-        for f in editable_files:
-            label = "✏️ Main Code" if f == script_path else f"✏️ {f}"
-            url = f"{BASE_URL}/editor?id={tid}&file={f}&uid={uid}"
-            file_btns.append(InlineKeyboardButton(label, web_app=WebAppInfo(url=url)))
-        
-        for i in range(0, len(file_btns), 2):
-            btns.append(file_btns[i:i+2])
-
+            btns.append([InlineKeyboardButton("🚀 Run", callback_data=f"rerun_{tid}")])
         btns.append([InlineKeyboardButton("📜 Logs", callback_data=f"log_{tid}"), InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{tid}")])
+        
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
 
     elif data.startswith("stop_"):
@@ -544,7 +393,7 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if tid in running_processes:
             os.killpg(os.getpgid(running_processes[tid]['process'].pid), signal.SIGTERM)
             await query.edit_message_text(f"🛑 Stopped `{tid}`")
-    
+            
     elif data.startswith("rerun_"):
         context.user_data['fallback_id'] = data.split("rerun_")[1]
         await query.delete_message()
@@ -557,7 +406,7 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             del running_processes[tid]
         delete_ownership(tid)
-        work_dir, _, _, _, _ = resolve_paths(tid)
+        work_dir, _, _, _ = resolve_paths(tid)
         if "|" in tid: shutil.rmtree(work_dir, ignore_errors=True)
         else: 
              try: os.remove(os.path.join(UPLOAD_DIR, tid))
